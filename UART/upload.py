@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 
-import serial
 import argparse
+import errno
 import os
 import stat
+import struct
 import sys
 from pathlib import Path
+
+import serial
+from serial.tools import list_ports
 from loguru import logger
+
+if os.name == "posix":
+    import fcntl
+    import termios
+else:
+    fcntl = None
+    termios = None
 
 DEFAULT_BAUDRATE = 57600
 DEFAULT_PORT = "/dev/ttyUSB0"
@@ -90,6 +101,114 @@ def read_bitstream_data(bitstream_file: str) -> bytearray:
     return data
 
 
+def parse_usb_vid_pid(usb_id: str) -> tuple[int, int]:
+    """Parse a USB ID string in VID:PID format (hex)."""
+    parts = usb_id.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid USB ID '{usb_id}'. Expected format is VID:PID (e.g. 0403:6001)."
+        )
+
+    try:
+        vid = int(parts[0], 16)
+        pid = int(parts[1], 16)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid USB ID '{usb_id}'. VID and PID must be hexadecimal numbers."
+        ) from e
+
+    if not (0 <= vid <= 0xFFFF and 0 <= pid <= 0xFFFF):
+        raise ValueError(
+            f"Invalid USB ID '{usb_id}'. VID and PID must be 16-bit hexadecimal values."
+        )
+
+    return vid, pid
+
+
+def resolve_port_by_usb_id(usb_id: str) -> str:
+    """Resolve a serial device path by USB VID:PID."""
+    vid, pid = parse_usb_vid_pid(usb_id)
+    matching_ports = [
+        port.device
+        for port in list_ports.comports()
+        if port.vid == vid and port.pid == pid and port.device
+    ]
+
+    if not matching_ports:
+        raise ValueError(
+            f"No serial device found for USB ID {vid:04x}:{pid:04x}."
+        )
+
+    if len(matching_ports) > 1:
+        ports = ", ".join(matching_ports)
+        raise ValueError(
+            f"Multiple devices found for USB ID {vid:04x}:{pid:04x}: {ports}"
+        )
+
+    return matching_ports[0]
+
+
+def resolve_target_port(port: str | None, usb_id: str | None) -> str:
+    """Resolve final device port from CLI options."""
+    if usb_id:
+        try:
+            return resolve_port_by_usb_id(usb_id)
+        except ValueError as e:
+            if port:
+                logger.warning(
+                    f"{e} Falling back to --port value '{port}'."
+                )
+                return port
+            raise
+
+    if port:
+        return port
+
+    return DEFAULT_PORT
+
+
+def set_custom_baudrate(ser, baudrate: int) -> None:
+    """Set a custom baud rate on Linux using termios.
+
+    :param ser: The serial port object.
+    :param baudrate: The custom baudrate to set.
+    """
+    if os.name != "posix" or fcntl is None or termios is None:
+        raise RuntimeError(
+            "Custom baud rate configuration is only supported on POSIX platforms."
+        )
+
+    # Linux termios2 ioctls and baud flags from asm-generic/termbits.h.
+    # The layout below assumes struct termios2 is 44 bytes on the target platform.
+    TCGETS2 = 0x802C542A
+    TCSETS2 = 0x402C542B
+    BOTHER = 0o010000
+    CBAUD = 0o010017
+
+    # Offsets in Linux termios2:
+    # c_iflag(0), c_oflag(4), c_cflag(8), c_lflag(12),
+    # c_line(16), c_cc[19](17-35), c_ispeed(36), c_ospeed(40)
+    C_CFLAG_OFFSET = 8
+    C_ISPEED_OFFSET = 36
+    C_OSPEED_OFFSET = 40
+
+    fd = ser.fileno()
+
+    # Get current serial port settings
+    buf = bytearray(fcntl.ioctl(fd, TCGETS2, b"\x00" * 44))
+
+    # Set custom speed flag
+    c_cflag = struct.unpack_from("I", buf, C_CFLAG_OFFSET)[0]
+    c_cflag &= ~CBAUD
+    c_cflag |= BOTHER
+
+    # Pack and set new settings
+    struct.pack_into("I", buf, C_CFLAG_OFFSET, c_cflag)
+    struct.pack_into("I", buf, C_ISPEED_OFFSET, baudrate)
+    struct.pack_into("I", buf, C_OSPEED_OFFSET, baudrate)
+    fcntl.ioctl(fd, TCSETS2, bytes(buf))
+
+
 def upload_bitstream(bitstream_file: str, baudrate: int, port: str) -> None:
     """Upload the bitstream to the eFPGA.
 
@@ -107,8 +226,25 @@ def upload_bitstream(bitstream_file: str, baudrate: int, port: str) -> None:
 
     logger.info("Uploading bitstream...")
 
-    with serial.Serial(port, baudrate) as ser:
-        ser.write(data)
+    # Try standard baud rate first
+    try:
+        with serial.Serial(port, baudrate) as ser:
+            ser.write(data)
+    except (ValueError, OSError, termios.error if termios else OSError) as e:
+        termios_errno = e.args[0] if getattr(e, "args", None) else None
+        should_fallback = (
+            isinstance(e, ValueError)
+            or getattr(e, "errno", None) == errno.EINVAL
+            or termios_errno == errno.EINVAL
+        )
+        if not should_fallback:
+            raise
+
+        # If standard baud rate fails, try custom baud rate
+        logger.info(f"Standard baud rate failed, attempting custom baud rate {baudrate}...")
+        with serial.Serial(port, 9600) as ser:  # Open with any standard rate first
+            set_custom_baudrate(ser, baudrate)
+            ser.write(data)
 
     logger.info("Bitstream transmitted!")
 
@@ -135,9 +271,16 @@ def __parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "-p",
         "--port",
-        help=f"Specifies the port. Defaults to {DEFAULT_PORT}",
+        help=f"Specifies the port. Defaults to {DEFAULT_PORT} unless --usb-id is used.",
         type=str,
-        default=DEFAULT_PORT,
+        default=None,
+    )
+    parser.add_argument(
+        "-u",
+        "--usb-id",
+        help="Specifies USB VID:PID (hex) to select a serial device, e.g. 0403:6001.",
+        type=str,
+        default=None,
     )
 
     parser.add_argument(
@@ -189,7 +332,13 @@ def main() -> None:
     """The main function containing the application logic"""
     args = __parse_arguments()
     setup_logger(args.verbose)
-    port = args.port
+
+    try:
+        port = resolve_target_port(args.port, args.usb_id)
+    except ValueError as e:
+        logger.error(e)
+        sys.exit(1)
+
     if not device_port_exists(port):
         exit()
     upload_bitstream(args.bitstream_file, args.baudrate, port)

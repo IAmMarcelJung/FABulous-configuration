@@ -1,3 +1,4 @@
 *.mpy
 *.bin
 .envrc
+__pycache__

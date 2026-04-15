@@ -11,7 +11,7 @@ simply use
 This is the general usage of the command:
 
 ```console
-upload.py [-h] [-b BAUDRATE] [-p PORT] [-v] bitstream_file
+upload.py [-h] [-b BAUDRATE] [-p PORT] [-u USB_ID] [-v] bitstream_file
 ```
 
 ### Example Use Case
@@ -26,3 +26,11 @@ Uploading a bitstream:
 ```
 
 This uses the default baudrate of 57600 Baud.
+
+Selecting by USB VID:PID:
+
+```console
+./upload.py -u 0403:6001 bitstream.bin
+```
+
+If both `--port` and `--usb-id` are given, `--usb-id` is tried first. If USB-ID resolution fails, the script logs a warning and falls back to `--port`.
